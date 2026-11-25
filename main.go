@@ -5,13 +5,51 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/streadway/amqp"
 )
+
+const (
+	defaultRabbitMQURL = "amqp://guest:guest@sirius-rabbitmq:5672/"
+	initialRetryDelay  = 5 * time.Second
+	maxRetryDelay      = 60 * time.Second
+)
+
+// resolveRabbitMQURL returns the configured RABBITMQ_URL, falling back to the
+// legacy Community default only when unset or blank.
+func resolveRabbitMQURL() string {
+	if configured := strings.TrimSpace(os.Getenv("RABBITMQ_URL")); configured != "" {
+		return configured
+	}
+	return defaultRabbitMQURL
+}
+
+// redactAMQPURL masks credentials before logging a broker URL.
+func redactAMQPURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "<redacted-amqp-url>"
+	}
+	return u.Redacted()
+}
+
+// nextRetryDelay applies bounded exponential backoff between reconnect attempts.
+func nextRetryDelay(current time.Duration) time.Duration {
+	if current < initialRetryDelay {
+		return initialRetryDelay
+	}
+	next := current * 2
+	if next > maxRetryDelay {
+		return maxRetryDelay
+	}
+	return next
+}
 
 // AdminCommand represents an administrative command
 type AdminCommand struct {
@@ -59,7 +97,7 @@ func (a *Administrator) Start(ctx context.Context) error {
 	log.Printf("Administrator listening for commands on queue: %s", adminQueue)
 
 	// Start RabbitMQ connection in a goroutine with retry logic
-	go a.connectToRabbitMQ(adminQueue)
+	go a.connectToRabbitMQ(ctx, adminQueue)
 
 	// Wait for shutdown signal
 	select {
@@ -72,34 +110,61 @@ func (a *Administrator) Start(ctx context.Context) error {
 	}
 }
 
-// connectToRabbitMQ connects to RabbitMQ with retry logic
-func (a *Administrator) connectToRabbitMQ(queueName string) {
-	rabbitMQURL := "amqp://guest:guest@sirius-rabbitmq:5672/"
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// connectToRabbitMQ connects to RabbitMQ with bounded exponential backoff.
+func (a *Administrator) connectToRabbitMQ(ctx context.Context, queueName string) {
+	rabbitMQURL := resolveRabbitMQURL()
+	safeURL := redactAMQPURL(rabbitMQURL)
+	retryDelay := initialRetryDelay
 
 	for {
-		log.Printf("Attempting to connect to RabbitMQ at %s", rabbitMQURL)
+		if ctx.Err() != nil {
+			return
+		}
+
+		log.Printf("Attempting to connect to RabbitMQ at %s", safeURL)
 
 		conn, err := amqp.Dial(rabbitMQURL)
 		if err != nil {
-			log.Printf("Failed to connect to RabbitMQ: %v, retrying in 5 seconds...", err)
-			time.Sleep(5 * time.Second)
+			log.Printf("Failed to connect to RabbitMQ: %v, retrying in %s...", err, retryDelay)
+			if !sleepWithContext(ctx, retryDelay) {
+				return
+			}
+			retryDelay = nextRetryDelay(retryDelay)
 			continue
 		}
 
+		retryDelay = initialRetryDelay
 		log.Printf("Successfully connected to RabbitMQ")
 
 		// Start consuming messages
 		if err := a.consumeMessages(conn, queueName); err != nil {
-			log.Printf("Error consuming messages: %v, reconnecting...", err)
+			log.Printf("Error consuming messages: %v, reconnecting in %s...", err, retryDelay)
 			conn.Close()
-			time.Sleep(5 * time.Second)
+			if !sleepWithContext(ctx, retryDelay) {
+				return
+			}
+			retryDelay = nextRetryDelay(retryDelay)
 			continue
 		}
 
 		// If we get here, the connection was lost
-		log.Printf("RabbitMQ connection lost, reconnecting...")
+		log.Printf("RabbitMQ connection lost, reconnecting in %s...", retryDelay)
 		conn.Close()
-		time.Sleep(5 * time.Second)
+		if !sleepWithContext(ctx, retryDelay) {
+			return
+		}
+		retryDelay = nextRetryDelay(retryDelay)
 	}
 }
 
